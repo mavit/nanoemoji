@@ -30,12 +30,16 @@ nanoemoji $(find ~/oss/twemoji/assets/svg -name '*.svg')
 from absl import app
 from absl import flags
 from absl import logging
+import glob
+from nanoemoji import config
+from nanoemoji.config import AxisPosition, FontConfig, MasterConfig
 from nanoemoji import write_font
 from ninja import ninja_syntax
 import os
+from pathlib import Path
 import subprocess
 import sys
-from typing import Sequence
+from typing import NamedTuple, Tuple, Sequence
 
 
 FLAGS = flags.FLAGS
@@ -47,25 +51,25 @@ flags.DEFINE_bool("gen_ninja", True, "Whether to regenerate build.ninja")
 flags.DEFINE_bool("exec_ninja", True, "Whether to run ninja.")
 
 
-def self_dir() -> str:
-    return os.path.dirname(os.path.abspath(__file__))
+def self_dir() -> Path:
+    return Path(__file__).parent.resolve()
 
 
-def build_dir() -> str:
-    return os.path.abspath(FLAGS.build_dir)
+def build_dir() -> Path:
+    return Path(FLAGS.build_dir).resolve()
 
 
-def rel_self(path: str) -> str:
-    path = os.path.normpath(os.path.join(self_dir(), path))
-    return os.path.relpath(path, self_dir())
+def rel(from_path: Path, to_path: Path) -> Path:
+    # relative_to(A,B) doesn't like it if B doesn't start with A
+    return Path(os.path.relpath(str(to_path.resolve()), str(from_path.resolve())))
 
 
-def rel_build(path: str) -> str:
-    return os.path.relpath(path, build_dir())
+def rel_self(path: Path) -> Path:
+    return rel(self_dir(), path)
 
 
-def resolve_rel_build(path):
-    return os.path.abspath(os.path.join(build_dir(), path))
+def rel_build(path: Path) -> Path:
+    return rel(build_dir(), path)
 
 
 def write_preamble(nw):
@@ -94,56 +98,104 @@ def write_preamble(nw):
     )
     nw.newline()
 
+    module_rule(
+        "write_variable_font", f"--config {rel_build(Path(FLAGS.config).resolve())} $in"
+    )
 
-def picosvg_dest(input_svg: str) -> str:
-    return os.path.join("picosvg", os.path.basename(input_svg))
+
+def picosvg_dest(master_name: str, svg: Path) -> str:
+    return os.path.join("picosvg", master_name, svg.name)
 
 
-def write_picosvg_builds(nw: ninja_syntax.Writer, svg_files: Sequence[str]):
-    for svg_file in svg_files:
-        nw.build(picosvg_dest(svg_file), "picosvg", rel_build(svg_file))
+def write_picosvg_builds(nw: ninja_syntax.Writer, master: MasterConfig):
+    os.makedirs(str(build_dir() / "picosvg" / master.name), exist_ok=True)
+    for svg_file in master.sources:
+        nw.build(
+            picosvg_dest(master.name, svg_file), "picosvg", str(rel_build(svg_file))
+        )
     nw.newline()
 
 
-def write_codepointmap_build(nw: ninja_syntax.Writer, svg_files: Sequence[str]):
+def write_source_names(source_names: Sequence[str]):
+    with open(os.path.join(build_dir(), "source_names.txt"), "w") as f:
+        for source_name in source_names:
+            f.write(source_name)
+            f.write("\n")
+
+
+def write_codepointmap_build(nw: ninja_syntax.Writer):
     dest_file = "codepointmap.csv"
-    nw.build(dest_file, "write_codepoints", [rel_build(f) for f in svg_files])
+    nw.build(dest_file, "write_codepoints", ["source_names.txt"])
     nw.newline()
 
 
-def write_fea_build(nw: ninja_syntax.Writer, svg_files: Sequence[str]):
+def write_fea_build(nw: ninja_syntax.Writer):
     nw.build("features.fea", "write_fea", "codepointmap.csv")
     nw.newline()
 
 
-def write_font_build(nw: ninja_syntax.Writer, svg_files: Sequence[str]):
-    inputs = ["codepointmap.csv", "features.fea"] + [picosvg_dest(f) for f in svg_files]
+def write_ufo_build(nw: ninja_syntax.Writer, master: MasterConfig):
+    inputs = ["codepointmap.csv", "features.fea"] + [
+        picosvg_dest(master.name, s) for s in master.sources
+    ]
     nw.build(
-        write_font.output_file(FLAGS.family, FLAGS.output, FLAGS.color_format),
-        "write_font",
-        inputs,
+        master.output_ufo, "write_font", inputs,
     )
+    nw.newline()
+
+
+def write_static_font_build(nw: ninja_syntax.Writer, font_config: FontConfig):
+    master = font_config.masters[0]
+    inputs = ["codepointmap.csv", "features.fea"] + [
+        picosvg_dest(master.name, s) for s in master.sources
+    ]
+    nw.build(
+        font_config.output_file, "write_font", inputs,
+    )
+    nw.newline()
+
+
+def write_variable_font_build(nw: ninja_syntax.Writer, font_config: FontConfig):
+    inputs = [m.output_ufo for m in font_config.masters]
+    nw.build(
+        font_config.output_file, "write_variable_font", inputs,
+    )
+    nw.newline()
 
 
 def _run(argv):
-    svg_files = [os.path.abspath(f) for f in argv[1:]]
-    if len(set(os.path.basename(f) for f in svg_files)) != len(svg_files):
-        sys.exit("Input svgs must have unique names")
+
+    font_config = config.load()
+
+    is_vf = len(font_config.masters) > 1
+    is_svg = font_config.color_format.endswith(
+        "svg"
+    ) or font_config.color_format.endswith("svgz")
+    if is_vf and is_svg:
+        raise ValueError("svg formats cannot have multiple masters")
 
     os.makedirs(build_dir(), exist_ok=True)
-    build_file = resolve_rel_build("build.ninja")
+    build_file = build_dir() / "build.ninja"
     if FLAGS.gen_ninja:
-        print(f"Generating {os.path.relpath(build_file)}")
+        print(f"Generating {build_file.relative_to(build_dir())}")
+        write_source_names(font_config.source_names)
         with open(build_file, "w") as f:
             nw = ninja_syntax.Writer(f)
             write_preamble(nw)
-            write_picosvg_builds(nw, svg_files)
-            write_codepointmap_build(nw, svg_files)
-            write_fea_build(nw, svg_files)
-            write_font_build(nw, svg_files)
 
-    # TODO: report on failed svgs
-    # this is the delta between inputs and picos
+            write_codepointmap_build(nw)
+            write_fea_build(nw)
+
+            for master in font_config.masters:
+                write_picosvg_builds(nw, master)
+                if is_vf:
+                    write_ufo_build(nw, master)
+
+            if is_vf:
+                write_variable_font_build(nw, font_config)
+            else:
+                write_static_font_build(nw, font_config)
+
     ninja_cmd = ["ninja", "-C", os.path.dirname(build_file)]
     if FLAGS.exec_ninja:
         print(" ".join(ninja_cmd))

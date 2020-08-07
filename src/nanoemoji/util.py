@@ -1,5 +1,3 @@
-# Copyright 2020 Google LLC
-#
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -12,17 +10,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Prints a csv of filename,codepoint sequence"""
-
-from absl import app
-from nanoemoji import codepoints
+"""Pure functions of a general nature."""
 
 
-def main(argv):
-    with open(argv[1]) as f:
-        for l in f:
-            print(codepoints.csv_line(l.strip()))
-
-
-if __name__ == "__main__":
-    app.run(main)
+def only(filter_fn, iterable):
+    gen = (v for v in iterable if filter_fn(v))
+    result = next(gen)
+    assert next(gen, None) is None
+    return result
